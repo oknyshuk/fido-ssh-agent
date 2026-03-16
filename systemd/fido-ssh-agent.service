@@ -1,0 +1,7 @@
+[Unit]
+Description=FIDO SSH Agent
+Requires=fido-ssh-agent.socket
+
+[Service]
+ExecStart=%h/.cargo/bin/fido-ssh-agent
+Restart=on-failure

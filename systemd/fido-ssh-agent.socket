@@ -1,0 +1,9 @@
+[Unit]
+Description=FIDO SSH Agent socket
+
+[Socket]
+ListenStream=%t/fido-ssh-agent.sock
+SocketMode=0600
+
+[Install]
+WantedBy=sockets.target

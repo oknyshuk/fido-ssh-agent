@@ -1,0 +1,14 @@
+[package]
+name = "fido-ssh-agent"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+ssh-agent-lib = "0.5"
+ssh-key = { version = "0.6", features = ["alloc", "ed25519"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "process", "sync", "signal"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+argh = "0.1"
