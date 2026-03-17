@@ -12,6 +12,7 @@ mod cache;
 mod ctap;
 mod pin;
 mod sk_sig;
+mod udev;
 
 /// FIDO2 SSH agent daemon
 #[derive(FromArgs)]
@@ -19,10 +20,6 @@ struct Args {
     /// path to the agent socket
     #[argh(option)]
     socket: Option<PathBuf>,
-
-    /// load credentials from plugged-in FIDO key at startup
-    #[argh(switch)]
-    load: bool,
 }
 
 fn is_pin_error(err: &anyhow::Error) -> bool {
@@ -32,7 +29,7 @@ fn is_pin_error(err: &anyhow::Error) -> bool {
 
 const MAX_PIN_ATTEMPTS: u32 = 3;
 
-async fn load_credentials(param: HidParam) -> Result<Vec<cache::CredentialEntry>> {
+pub(crate) async fn load_credentials(param: HidParam) -> Result<Vec<cache::CredentialEntry>> {
     for attempt in 1..=MAX_PIN_ATTEMPTS {
         let pin =
             tokio::task::spawn_blocking(|| pin::request_pin("Enter PIN for FIDO2 security key"))
@@ -74,24 +71,13 @@ async fn main() -> Result<()> {
     let socket_path = resolve_socket_path(args.socket)?;
     let cache = Arc::new(RwLock::new(cache::CredentialCache::new()));
 
-    if args.load {
-        let params = tokio::task::spawn_blocking(ctap::get_device_params).await?;
-
-        if let Some(param) = params.into_iter().next() {
-            let entries = load_credentials(param).await?;
-            let mut w = cache.write().await;
-            w.extend(entries);
-            info!("loaded {} credential(s)", w.len());
-        } else {
-            info!("no FIDO device found, skipping credential load");
-        }
-    }
-
     let _ = std::fs::remove_file(&socket_path);
     let listener =
         tokio::net::UnixListener::bind(&socket_path).context("failed to bind agent socket")?;
 
     info!("listening on {}", socket_path.display());
+
+    udev::start(cache.clone());
 
     ssh_agent_lib::agent::listen(listener, agent::FidoAgent::new(cache)).await?;
 

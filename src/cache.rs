@@ -23,12 +23,6 @@ impl CredentialCache {
         }
     }
 
-    #[allow(dead_code)] // Phase 4
-    pub fn insert(&mut self, entry: CredentialEntry) {
-        self.entries
-            .insert(entry.public_key.key_data().clone(), entry);
-    }
-
     pub fn extend(&mut self, entries: impl IntoIterator<Item = CredentialEntry>) {
         self.entries.extend(
             entries
@@ -51,7 +45,21 @@ impl CredentialCache {
             .collect()
     }
 
-    pub fn len(&self) -> usize {
-        self.entries.len()
+    /// Remove entries whose device_param is not in `active`. Returns count removed.
+    pub fn retain_devices(&mut self, active: &[HidParam]) -> usize {
+        let before = self.entries.len();
+        self.entries
+            .retain(|_, e| active.iter().any(|p| hid_param_eq(p, &e.device_param)));
+        before - self.entries.len()
+    }
+}
+
+pub(crate) fn hid_param_eq(a: &HidParam, b: &HidParam) -> bool {
+    match (a, b) {
+        (HidParam::VidPid { vid: v1, pid: p1 }, HidParam::VidPid { vid: v2, pid: p2 }) => {
+            v1 == v2 && p1 == p2
+        }
+        (HidParam::Path(a), HidParam::Path(b)) => a == b,
+        _ => false,
     }
 }
