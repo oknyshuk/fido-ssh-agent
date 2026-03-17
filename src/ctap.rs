@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use ctap_hid_fido2::fidokey::get_assertion::get_assertion_params::GetAssertionArgsBuilder;
 use ctap_hid_fido2::fidokey::get_info::InfoOption;
 use ctap_hid_fido2::public_key::PublicKeyType;
 use ctap_hid_fido2::{Cfg, FidoKeyHidFactory, HidParam};
@@ -8,6 +9,19 @@ use tracing::debug;
 
 use crate::cache::CredentialEntry;
 
+fn cfg() -> Cfg {
+    Cfg {
+        keep_alive_msg: String::new(),
+        ..Cfg::init()
+    }
+}
+
+pub struct AssertionResponse {
+    pub signature: Vec<u8>,
+    pub flags: u8,
+    pub counter: u32,
+}
+
 pub fn get_device_params() -> Vec<HidParam> {
     ctap_hid_fido2::get_fidokey_devices()
         .into_iter()
@@ -16,7 +30,7 @@ pub fn get_device_params() -> Vec<HidParam> {
 }
 
 pub fn enumerate_credentials(param: &HidParam, pin: &SecretString) -> Result<Vec<CredentialEntry>> {
-    let device = FidoKeyHidFactory::create_by_params(&[param.clone()], &Cfg::init())
+    let device = FidoKeyHidFactory::create_by_params(std::slice::from_ref(param), &cfg())
         .context("failed to open FIDO device")?;
 
     let has_cred_mgmt = matches!(
@@ -76,4 +90,37 @@ pub fn enumerate_credentials(param: &HidParam, pin: &SecretString) -> Result<Vec
     }
 
     Ok(entries)
+}
+
+pub fn get_assertion(
+    param: &HidParam,
+    pin: &SecretString,
+    credential_id: &[u8],
+    application: &str,
+    data: &[u8],
+) -> Result<AssertionResponse> {
+    let device = FidoKeyHidFactory::create_by_params(std::slice::from_ref(param), &cfg())
+        .context("failed to open FIDO device")?;
+
+    let args = GetAssertionArgsBuilder::new(application, data)
+        .pin(pin.expose_secret())
+        .credential_id(credential_id)
+        .build();
+
+    let assertions = device
+        .get_assertion_with_args(&args)
+        .context("assertion failed (touch your key if prompted)")?;
+
+    let assertion = assertions
+        .into_iter()
+        .next()
+        .context("no assertion returned")?;
+
+    let flags = *assertion.auth_data.get(32).context("auth_data too short")?;
+
+    Ok(AssertionResponse {
+        signature: assertion.signature,
+        flags,
+        counter: assertion.sign_count,
+    })
 }

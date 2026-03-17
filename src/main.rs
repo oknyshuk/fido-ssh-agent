@@ -11,6 +11,7 @@ mod agent;
 mod cache;
 mod ctap;
 mod pin;
+mod sk_sig;
 
 /// FIDO2 SSH agent daemon
 #[derive(FromArgs)]

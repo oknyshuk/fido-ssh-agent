@@ -5,6 +5,7 @@ use ssh_agent_lib::error::AgentError;
 use ssh_agent_lib::proto::{Identity, SignRequest};
 use ssh_key::Signature;
 use tokio::sync::RwLock;
+use tracing::{debug, error, info};
 
 use crate::cache::CredentialCache;
 
@@ -26,10 +27,54 @@ impl Session for FidoAgent {
         Ok(cache.identities())
     }
 
-    async fn sign(&mut self, _request: SignRequest) -> Result<Signature, AgentError> {
-        Err(AgentError::from(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "signing not yet implemented",
-        )))
+    async fn sign(&mut self, request: SignRequest) -> Result<Signature, AgentError> {
+        let (credential_id, application, device_param) = {
+            let cache = self.cache.read().await;
+            let entry = cache.lookup(&request.pubkey).ok_or_else(|| {
+                AgentError::other(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "unknown key",
+                ))
+            })?;
+            (
+                entry.credential_id.clone(),
+                entry.application.clone(),
+                entry.device_param.clone(),
+            )
+        };
+
+        info!(application, "sign request — enter PIN and touch key");
+
+        let pin = tokio::task::spawn_blocking(|| {
+            crate::pin::request_pin("Enter PIN for FIDO2 security key")
+        })
+        .await
+        .map_err(AgentError::other)?
+        .map_err(|e| AgentError::Other(e.into()))?;
+
+        let data = request.data;
+        let response = tokio::task::spawn_blocking(move || {
+            crate::ctap::get_assertion(&device_param, &pin, &credential_id, &application, &data)
+        })
+        .await
+        .map_err(AgentError::other)?
+        .map_err(|e| {
+            error!("assertion failed: {e:#}");
+            AgentError::Other(e.into())
+        })?;
+
+        debug!(
+            sig_len = response.signature.len(),
+            flags = format!("0x{:02x}", response.flags),
+            counter = response.counter,
+            "assertion succeeded"
+        );
+
+        let sig = crate::sk_sig::encode(&response).map_err(|e| {
+            error!("signature encoding failed: {e}");
+            AgentError::other(e)
+        })?;
+
+        Ok(sig)
     }
 }
