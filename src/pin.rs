@@ -48,5 +48,5 @@ pub fn request_pin(prompt: &str) -> Result<SecretString> {
     if let Some(result) = try_askpass("kdialog", &["--password", prompt]) {
         return result;
     }
-    bail!("no askpass program found — set SSH_ASKPASS or install zenity/kdialog")
+    bail!("no askpass program found - set SSH_ASKPASS or install zenity/kdialog")
 }

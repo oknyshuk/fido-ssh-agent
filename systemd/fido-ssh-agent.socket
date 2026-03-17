@@ -1,9 +1,10 @@
 [Unit]
 Description=FIDO SSH Agent socket
+Before=graphical-session-pre.target
 
 [Socket]
 ListenStream=%t/fido-ssh-agent.sock
-SocketMode=0600
+ExecStartPost=/bin/systemctl --user set-environment SSH_AUTH_SOCK=%t/fido-ssh-agent.sock
 
 [Install]
 WantedBy=sockets.target

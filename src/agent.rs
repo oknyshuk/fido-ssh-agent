@@ -13,11 +13,15 @@ use crate::cache::CredentialCache;
 #[derive(Clone)]
 pub struct FidoAgent {
     pub(crate) cache: Arc<RwLock<CredentialCache>>,
+    pub(crate) upstream: Option<Arc<str>>,
 }
 
 impl FidoAgent {
-    pub fn new(cache: Arc<RwLock<CredentialCache>>) -> Self {
-        Self { cache }
+    pub fn new(cache: Arc<RwLock<CredentialCache>>, upstream: Option<String>) -> Self {
+        Self {
+            cache,
+            upstream: upstream.map(Into::into),
+        }
     }
 }
 
@@ -25,23 +29,59 @@ impl FidoAgent {
 impl Session for FidoAgent {
     async fn request_identities(&mut self) -> Result<Vec<Identity>, AgentError> {
         let cache = self.cache.read().await;
-        Ok(cache.identities())
+        let mut ids = cache.identities();
+        if let Some(ref upstream) = self.upstream {
+            match crate::upstream::list_identities(upstream).await {
+                Ok(upstream_ids) => {
+                    // Deduplicate: skip upstream keys already served from FIDO cache
+                    ids.extend(
+                        upstream_ids
+                            .into_iter()
+                            .filter(|id| cache.lookup(&id.pubkey).is_none()),
+                    );
+                }
+                Err(e) => eprintln!("[WARN] upstream agent: {e:#}"),
+            }
+        }
+        Ok(ids)
     }
 
     async fn sign(&mut self, request: SignRequest) -> Result<Signature, AgentError> {
-        let (credential_id, application, device_param) = {
+        let fido_entry = {
             let cache = self.cache.read().await;
-            let entry = cache.lookup(&request.pubkey).ok_or_else(|| {
-                AgentError::other(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "unknown key",
-                ))
-            })?;
-            (
-                entry.credential_id.clone(),
-                entry.application.clone(),
-                entry.device_param.clone(),
-            )
+            cache.lookup(&request.pubkey).map(|e| {
+                (
+                    e.credential_id.clone(),
+                    e.application.clone(),
+                    e.device_param.clone(),
+                )
+            })
+        };
+
+        let Some((credential_id, application, device_param)) = fido_entry else {
+            // Not a FIDO key - forward to upstream agent
+            if let Some(ref upstream) = self.upstream {
+                eprintln!(
+                    "[INFO] sign request for non-FIDO key ({}) -> upstream",
+                    request.pubkey.algorithm(),
+                );
+                return crate::upstream::sign(
+                    upstream,
+                    &request.pubkey,
+                    &request.data,
+                    request.flags,
+                )
+                .await
+                .map_err(|e| AgentError::Other(e.into()));
+            }
+            eprintln!(
+                "[WARN] sign request for unknown key ({})",
+                request.pubkey.algorithm()
+            );
+            return Err(AgentError::other(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "unknown key",
+            )));
         };
 
         // Try cached PIN first
@@ -62,7 +102,7 @@ impl Session for FidoAgent {
                 Err(e) if crate::ctap::is_pin_error(&e) => {
                     self.cache.write().await.remove_pin(&device_param);
                     eprintln!(
-                        "[INFO] cached PIN invalid for {application} — enter PIN and touch key"
+                        "[INFO] cached PIN invalid for {application} - enter PIN and touch key"
                     );
                     let fresh_pin = prompt_pin().await?;
                     let resp = attempt_assertion(
@@ -86,7 +126,7 @@ impl Session for FidoAgent {
                 }
             }
         } else {
-            eprintln!("[INFO] sign request for {application} — enter PIN and touch key");
+            eprintln!("[INFO] sign request for {application} - enter PIN and touch key");
             let pin = prompt_pin().await?;
             let resp = attempt_assertion(
                 &device_param,
@@ -112,6 +152,10 @@ impl Session for FidoAgent {
             AgentError::other(e)
         })?;
 
+        eprintln!(
+            "[INFO] signed for {application} (flags=0x{:02x}, counter={})",
+            response.flags, response.counter,
+        );
         Ok(sig)
     }
 }

@@ -69,7 +69,7 @@
 
           devShells.default = craneLib.devShell {
             inherit buildInputs nativeBuildInputs;
-            RUST_BACKTRACE = 1;
+            packages = [ pkgs.just ];
             LD_LIBRARY_PATH = lib.makeLibraryPath buildInputs;
           };
         }

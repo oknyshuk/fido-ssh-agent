@@ -103,11 +103,10 @@ async fn reconcile(cache: &Arc<RwLock<CredentialCache>>, attempted: &mut Vec<Hid
             continue;
         }
 
-        attempted.push(param.clone());
-
         eprintln!("[INFO] new FIDO device detected, loading credentials");
-        match crate::load_credentials(param, cache).await {
+        match crate::load_credentials(param.clone(), cache).await {
             Ok(entries) => {
+                attempted.push(param);
                 let count = entries.len();
                 let mut w = cache.write().await;
                 w.extend(entries);

@@ -1,3 +1,4 @@
+use std::os::unix::io::FromRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -11,6 +12,7 @@ mod cache;
 mod ctap;
 mod pin;
 mod udev;
+mod upstream;
 
 const MAX_PIN_ATTEMPTS: u32 = 3;
 
@@ -70,6 +72,32 @@ fn parse_socket_arg() -> Option<PathBuf> {
     }
 }
 
+fn find_upstream() -> Option<String> {
+    if let Ok(path) = std::env::var("FIDO_UPSTREAM_AUTH_SOCK")
+        && std::path::Path::new(&path).exists()
+    {
+        return Some(path);
+    }
+    let runtime = std::env::var("XDG_RUNTIME_DIR").ok()?;
+    for suffix in ["gcr/ssh", "keyring/ssh", "ssh-agent.socket"] {
+        let path = format!("{runtime}/{suffix}");
+        if std::path::Path::new(&path).exists() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn systemd_listener() -> Result<Option<tokio::net::UnixListener>> {
+    let mut fds = sd_notify::listen_fds()?;
+    let Some(fd) = fds.next() else {
+        return Ok(None);
+    };
+    let std_listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
+    std_listener.set_nonblocking(true)?;
+    Ok(Some(tokio::net::UnixListener::from_std(std_listener)?))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Suppress println! noise from ctap-hid-fido2 (we log to stderr)
@@ -81,18 +109,32 @@ async fn main() -> Result<()> {
         }
     }
 
-    let socket_path = resolve_socket_path(parse_socket_arg())?;
+    let listener = match systemd_listener()? {
+        Some(l) => {
+            eprintln!("[INFO] using systemd socket activation");
+            l
+        }
+        None => {
+            let socket_path = resolve_socket_path(parse_socket_arg())?;
+            let _ = std::fs::remove_file(&socket_path);
+            let l = tokio::net::UnixListener::bind(&socket_path)
+                .context("failed to bind agent socket")?;
+            eprintln!("[INFO] listening on {}", socket_path.display());
+            l
+        }
+    };
+
+    let upstream = find_upstream();
+    if let Some(ref path) = upstream {
+        eprintln!("[INFO] upstream agent: {path}");
+    }
+
     let cache = Arc::new(RwLock::new(cache::CredentialCache::new()));
-
-    let _ = std::fs::remove_file(&socket_path);
-    let listener =
-        tokio::net::UnixListener::bind(&socket_path).context("failed to bind agent socket")?;
-
-    eprintln!("[INFO] listening on {}", socket_path.display());
-
     udev::start(cache.clone());
 
-    ssh_agent_lib::agent::listen(listener, agent::FidoAgent::new(cache)).await?;
+    let _ = sd_notify::notify(&[sd_notify::NotifyState::Ready]);
+
+    ssh_agent_lib::agent::listen(listener, agent::FidoAgent::new(cache, upstream)).await?;
 
     Ok(())
 }

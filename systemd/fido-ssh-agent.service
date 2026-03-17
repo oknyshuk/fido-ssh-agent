@@ -1,7 +1,11 @@
 [Unit]
 Description=FIDO SSH Agent
-Requires=fido-ssh-agent.socket
+After=graphical-session.target
 
 [Service]
-ExecStart=%h/.cargo/bin/fido-ssh-agent
+Type=notify
+ExecStart=%h/.nix-profile/bin/fido-ssh-agent
 Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target
