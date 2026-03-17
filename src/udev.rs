@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use ctap_hid_fido2::HidParam;
 use tokio::sync::{RwLock, mpsc};
-use tracing::{debug, info, warn};
 
 use crate::cache::{self, CredentialCache};
 
@@ -17,11 +16,11 @@ pub fn start(cache: Arc<RwLock<CredentialCache>>) {
         .name("udev-monitor".into())
         .spawn(move || {
             if let Err(e) = poll_loop(tx) {
-                tracing::error!("udev monitor failed: {e}");
+                eprintln!("[ERROR] udev monitor failed: {e}");
             }
         })
     {
-        warn!("failed to start udev monitor thread: {e}");
+        eprintln!("[WARN] failed to start udev monitor thread: {e}");
         return;
     }
 
@@ -33,7 +32,7 @@ fn poll_loop(tx: mpsc::UnboundedSender<()>) -> std::io::Result<()> {
         .match_subsystem("hidraw")?
         .listen()?;
 
-    info!("udev monitor started, watching for FIDO devices");
+    eprintln!("[INFO] udev monitor started, watching for FIDO devices");
 
     let mut pollfd = libc::pollfd {
         fd: monitor.as_raw_fd(),
@@ -53,15 +52,8 @@ fn poll_loop(tx: mpsc::UnboundedSender<()>) -> std::io::Result<()> {
 
         for event in monitor.iter() {
             match event.event_type() {
-                udev::EventType::Add | udev::EventType::Remove => {
-                    debug!(
-                        syspath = ?event.syspath(),
-                        action = ?event.event_type(),
-                        "hidraw event"
-                    );
-                    if tx.send(()).is_err() {
-                        return Ok(());
-                    }
+                udev::EventType::Add | udev::EventType::Remove if tx.send(()).is_err() => {
+                    return Ok(());
                 }
                 _ => {}
             }
@@ -88,7 +80,7 @@ async fn reconcile(cache: &Arc<RwLock<CredentialCache>>, attempted: &mut Vec<Hid
     let active = match tokio::task::spawn_blocking(crate::ctap::get_device_params).await {
         Ok(p) => p,
         Err(e) => {
-            warn!("failed to scan FIDO devices: {e}");
+            eprintln!("[WARN] failed to scan FIDO devices: {e}");
             return;
         }
     };
@@ -98,7 +90,7 @@ async fn reconcile(cache: &Arc<RwLock<CredentialCache>>, attempted: &mut Vec<Hid
         let mut w = cache.write().await;
         let removed = w.retain_devices(&active);
         if removed > 0 {
-            info!("evicted {removed} credential(s) for removed device");
+            eprintln!("[INFO] evicted {removed} credential(s) for removed device");
         }
     }
 
@@ -113,20 +105,18 @@ async fn reconcile(cache: &Arc<RwLock<CredentialCache>>, attempted: &mut Vec<Hid
 
         attempted.push(param.clone());
 
-        info!("new FIDO device detected, loading credentials");
-        match crate::load_credentials(param).await {
+        eprintln!("[INFO] new FIDO device detected, loading credentials");
+        match crate::load_credentials(param, cache).await {
             Ok(entries) => {
                 let count = entries.len();
                 let mut w = cache.write().await;
                 w.extend(entries);
                 if count > 0 {
-                    info!("loaded {count} credential(s) from new device");
-                } else {
-                    debug!("device has no SSH credentials");
+                    eprintln!("[INFO] loaded {count} credential(s) from new device");
                 }
             }
             Err(e) => {
-                warn!("failed to load credentials from new device: {e:#}");
+                eprintln!("[WARN] failed to load credentials from new device: {e:#}");
             }
         }
     }

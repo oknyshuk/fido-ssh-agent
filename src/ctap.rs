@@ -5,9 +5,13 @@ use ctap_hid_fido2::public_key::PublicKeyType;
 use ctap_hid_fido2::{Cfg, FidoKeyHidFactory, HidParam};
 use secrecy::{ExposeSecret, SecretString};
 use ssh_key::public::{Ed25519PublicKey, KeyData, SkEd25519};
-use tracing::debug;
 
 use crate::cache::CredentialEntry;
+
+pub fn is_pin_error(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:?}");
+    msg.contains("CTAP2_ERR_PIN_INVALID") || msg.contains("CTAP2_ERR_PIN_AUTH_INVALID")
+}
 
 fn cfg() -> Cfg {
     Cfg {
@@ -62,11 +66,6 @@ pub fn enumerate_credentials(param: &HidParam, pin: &SecretString) -> Result<Vec
 
         for cred in &creds {
             if !matches!(cred.public_key.key_type, PublicKeyType::Ed25519) {
-                debug!(
-                    rp = rp_id,
-                    key_type = ?cred.public_key.key_type,
-                    "skipping non-Ed25519 credential"
-                );
                 continue;
             }
 

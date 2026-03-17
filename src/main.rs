@@ -2,44 +2,37 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use argh::FromArgs;
 use ctap_hid_fido2::HidParam;
+use secrecy::{ExposeSecret, SecretString};
 use tokio::sync::RwLock;
-use tracing::{info, warn};
 
 mod agent;
 mod cache;
 mod ctap;
 mod pin;
-mod sk_sig;
 mod udev;
-
-/// FIDO2 SSH agent daemon
-#[derive(FromArgs)]
-struct Args {
-    /// path to the agent socket
-    #[argh(option)]
-    socket: Option<PathBuf>,
-}
-
-fn is_pin_error(err: &anyhow::Error) -> bool {
-    let msg = format!("{err:?}");
-    msg.contains("CTAP2_ERR_PIN_INVALID") || msg.contains("CTAP2_ERR_PIN_AUTH_INVALID")
-}
 
 const MAX_PIN_ATTEMPTS: u32 = 3;
 
-pub(crate) async fn load_credentials(param: HidParam) -> Result<Vec<cache::CredentialEntry>> {
+pub(crate) async fn load_credentials(
+    param: HidParam,
+    cache: &Arc<RwLock<cache::CredentialCache>>,
+) -> Result<Vec<cache::CredentialEntry>> {
     for attempt in 1..=MAX_PIN_ATTEMPTS {
-        let pin =
-            tokio::task::spawn_blocking(|| pin::request_pin("Enter PIN for FIDO2 security key"))
-                .await??;
+        let pin = tokio::task::spawn_blocking(|| pin::request_pin("Enter PIN for security key"))
+            .await??;
 
+        let pin_for_ctap = SecretString::from(pin.expose_secret().to_string());
         let p = param.clone();
-        match tokio::task::spawn_blocking(move || ctap::enumerate_credentials(&p, &pin)).await? {
-            Ok(entries) => return Ok(entries),
-            Err(e) if is_pin_error(&e) && attempt < MAX_PIN_ATTEMPTS => {
-                warn!("wrong PIN ({attempt}/{MAX_PIN_ATTEMPTS})");
+        match tokio::task::spawn_blocking(move || ctap::enumerate_credentials(&p, &pin_for_ctap))
+            .await?
+        {
+            Ok(entries) => {
+                cache.write().await.set_pin(&param, pin);
+                return Ok(entries);
+            }
+            Err(e) if ctap::is_pin_error(&e) && attempt < MAX_PIN_ATTEMPTS => {
+                eprintln!("[WARN] wrong PIN ({attempt}/{MAX_PIN_ATTEMPTS})");
             }
             Err(e) => return Err(e),
         }
@@ -58,24 +51,44 @@ fn resolve_socket_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
     Ok(PathBuf::from(runtime_dir).join("fido-ssh-agent.sock"))
 }
 
+fn parse_socket_arg() -> Option<PathBuf> {
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        Some("--socket") => Some(PathBuf::from(
+            args.next().expect("--socket requires a path"),
+        )),
+        Some("--help" | "-h") => {
+            eprintln!("Usage: fido-ssh-agent [--socket PATH]");
+            std::process::exit(0);
+        }
+        Some(other) => {
+            eprintln!("unknown argument: {other}");
+            eprintln!("Usage: fido-ssh-agent [--socket PATH]");
+            std::process::exit(1);
+        }
+        None => None,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("fido_ssh_agent=info".parse()?),
-        )
-        .init();
+    // Suppress println! noise from ctap-hid-fido2 (we log to stderr)
+    unsafe {
+        let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+        if devnull >= 0 {
+            libc::dup2(devnull, libc::STDOUT_FILENO);
+            libc::close(devnull);
+        }
+    }
 
-    let args: Args = argh::from_env();
-    let socket_path = resolve_socket_path(args.socket)?;
+    let socket_path = resolve_socket_path(parse_socket_arg())?;
     let cache = Arc::new(RwLock::new(cache::CredentialCache::new()));
 
     let _ = std::fs::remove_file(&socket_path);
     let listener =
         tokio::net::UnixListener::bind(&socket_path).context("failed to bind agent socket")?;
 
-    info!("listening on {}", socket_path.display());
+    eprintln!("[INFO] listening on {}", socket_path.display());
 
     udev::start(cache.clone());
 

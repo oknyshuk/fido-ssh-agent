@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
+use ctap_hid_fido2::HidParam;
+use secrecy::{ExposeSecret, SecretString};
 use ssh_agent_lib::agent::Session;
 use ssh_agent_lib::error::AgentError;
 use ssh_agent_lib::proto::{Identity, SignRequest};
-use ssh_key::Signature;
+use ssh_key::{Algorithm, Signature};
 use tokio::sync::RwLock;
-use tracing::{debug, error, info};
 
 use crate::cache::CredentialCache;
 
@@ -43,38 +44,100 @@ impl Session for FidoAgent {
             )
         };
 
-        info!(application, "sign request — enter PIN and touch key");
+        // Try cached PIN first
+        let cached_pin = self.cache.read().await.get_pin(&device_param);
 
-        let pin = tokio::task::spawn_blocking(|| {
-            crate::pin::request_pin("Enter PIN for FIDO2 security key")
-        })
-        .await
-        .map_err(AgentError::other)?
-        .map_err(|e| AgentError::Other(e.into()))?;
+        let response = if let Some(pin) = cached_pin {
+            eprintln!("[INFO] sign request for {application} - touch key");
+            match attempt_assertion(
+                &device_param,
+                &pin,
+                &credential_id,
+                &application,
+                &request.data,
+            )
+            .await?
+            {
+                Ok(resp) => resp,
+                Err(e) if crate::ctap::is_pin_error(&e) => {
+                    self.cache.write().await.remove_pin(&device_param);
+                    eprintln!(
+                        "[INFO] cached PIN invalid for {application} — enter PIN and touch key"
+                    );
+                    let fresh_pin = prompt_pin().await?;
+                    let resp = attempt_assertion(
+                        &device_param,
+                        &fresh_pin,
+                        &credential_id,
+                        &application,
+                        &request.data,
+                    )
+                    .await?
+                    .map_err(|e| {
+                        eprintln!("[ERROR] assertion failed: {e:#}");
+                        AgentError::Other(e.into())
+                    })?;
+                    self.cache.write().await.set_pin(&device_param, fresh_pin);
+                    resp
+                }
+                Err(e) => {
+                    eprintln!("[ERROR] assertion failed: {e:#}");
+                    return Err(AgentError::Other(e.into()));
+                }
+            }
+        } else {
+            eprintln!("[INFO] sign request for {application} — enter PIN and touch key");
+            let pin = prompt_pin().await?;
+            let resp = attempt_assertion(
+                &device_param,
+                &pin,
+                &credential_id,
+                &application,
+                &request.data,
+            )
+            .await?
+            .map_err(|e| {
+                eprintln!("[ERROR] assertion failed: {e:#}");
+                AgentError::Other(e.into())
+            })?;
+            self.cache.write().await.set_pin(&device_param, pin);
+            resp
+        };
 
-        let data = request.data;
-        let response = tokio::task::spawn_blocking(move || {
-            crate::ctap::get_assertion(&device_param, &pin, &credential_id, &application, &data)
-        })
-        .await
-        .map_err(AgentError::other)?
-        .map_err(|e| {
-            error!("assertion failed: {e:#}");
-            AgentError::Other(e.into())
-        })?;
-
-        debug!(
-            sig_len = response.signature.len(),
-            flags = format!("0x{:02x}", response.flags),
-            counter = response.counter,
-            "assertion succeeded"
-        );
-
-        let sig = crate::sk_sig::encode(&response).map_err(|e| {
-            error!("signature encoding failed: {e}");
+        let mut sig_data = response.signature;
+        sig_data.push(response.flags);
+        sig_data.extend(response.counter.to_be_bytes());
+        let sig = Signature::new(Algorithm::SkEd25519, sig_data).map_err(|e| {
+            eprintln!("[ERROR] signature encoding failed: {e}");
             AgentError::other(e)
         })?;
 
         Ok(sig)
     }
+}
+
+async fn prompt_pin() -> Result<SecretString, AgentError> {
+    tokio::task::spawn_blocking(|| crate::pin::request_pin("Enter PIN for FIDO2 security key"))
+        .await
+        .map_err(AgentError::other)?
+        .map_err(|e| AgentError::Other(e.into()))
+}
+
+async fn attempt_assertion(
+    device_param: &HidParam,
+    pin: &SecretString,
+    credential_id: &[u8],
+    application: &str,
+    data: &[u8],
+) -> Result<Result<crate::ctap::AssertionResponse, anyhow::Error>, AgentError> {
+    let param = device_param.clone();
+    let pin = SecretString::from(pin.expose_secret().to_string());
+    let cred_id = credential_id.to_vec();
+    let app = application.to_string();
+    let data = data.to_vec();
+    tokio::task::spawn_blocking(move || {
+        crate::ctap::get_assertion(&param, &pin, &cred_id, &app, &data)
+    })
+    .await
+    .map_err(AgentError::other)
 }
