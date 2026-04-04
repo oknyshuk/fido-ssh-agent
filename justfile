@@ -12,8 +12,6 @@ install: build
     mkdir -p {{ unit_dir }} {{ autostart_dir }}
     cp systemd/fido-ssh-agent.socket {{ unit_dir }}/
     cp systemd/fido-ssh-agent.service {{ unit_dir }}/
-    cp /etc/xdg/autostart/gnome-keyring-ssh.desktop {{ autostart_dir }}/
-    echo "Hidden=true" >> {{ autostart_dir }}/gnome-keyring-ssh.desktop
     systemctl --user mask gpg-agent-ssh.socket
     systemctl --user daemon-reload
     systemctl --user enable --now fido-ssh-agent.socket fido-ssh-agent.service

@@ -1,5 +1,6 @@
 [Unit]
 Description=FIDO SSH Agent socket
+After=gcr-ssh-agent.socket gpg-agent-ssh.socket
 Before=graphical-session-pre.target
 
 [Socket]
