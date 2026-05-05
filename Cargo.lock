@@ -448,13 +448,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ctap-hid-fido2",
+ "futures",
  "libc",
  "sd-notify",
  "secrecy",
  "ssh-agent-lib",
  "ssh-key",
  "tokio",
- "udev",
+ "tokio-udev",
 ]
 
 [[package]]
@@ -1414,6 +1415,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tokio-udev"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d239a184f334141ead9fce462203705d199d053a63d00e25c8caf4e717149233"
+dependencies = [
+ "futures-core",
+ "tokio",
+ "udev",
 ]
 
 [[package]]

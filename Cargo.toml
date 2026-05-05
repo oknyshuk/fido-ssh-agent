@@ -7,13 +7,14 @@ license = "MIT"
 [dependencies]
 ssh-agent-lib = "0.5"
 ssh-key = { version = "0.6", default-features = false, features = ["alloc", "ed25519"] }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "io-util", "time"] }
 anyhow = "1"
 ctap-hid-fido2 = "3.5"
 secrecy = "0.10"
-udev = "0.9"
-libc = "0.2"
+tokio-udev = "0.10"
+futures = { version = "0.3", default-features = false, features = ["std"] }
 sd-notify = "0.5"
+libc = "0.2"
 
 [profile.dev]
 debug = "line-tables-only"

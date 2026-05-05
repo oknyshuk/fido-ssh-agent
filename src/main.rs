@@ -3,21 +3,20 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use ctap_hid_fido2::HidParam;
 use secrecy::{ExposeSecret, SecretString};
 use tokio::sync::RwLock;
+use tokio::task::LocalSet;
 
 mod agent;
 mod cache;
 mod ctap;
 mod pin;
 mod udev;
-mod upstream;
 
 const MAX_PIN_ATTEMPTS: u32 = 3;
 
 pub(crate) async fn load_credentials(
-    param: HidParam,
+    device: cache::DeviceKey,
     cache: &Arc<RwLock<cache::CredentialCache>>,
 ) -> Result<Vec<cache::CredentialEntry>> {
     for attempt in 1..=MAX_PIN_ATTEMPTS {
@@ -25,12 +24,12 @@ pub(crate) async fn load_credentials(
             .await??;
 
         let pin_for_ctap = SecretString::from(pin.expose_secret().to_string());
-        let p = param.clone();
-        match tokio::task::spawn_blocking(move || ctap::enumerate_credentials(&p, &pin_for_ctap))
+        let d = device.clone();
+        match tokio::task::spawn_blocking(move || ctap::enumerate_credentials(&d, &pin_for_ctap))
             .await?
         {
             Ok(entries) => {
-                cache.write().await.set_pin(&param, pin);
+                cache.write().await.set_pin(&device, pin);
                 return Ok(entries);
             }
             Err(e) if ctap::is_pin_error(&e) && attempt < MAX_PIN_ATTEMPTS => {
@@ -39,7 +38,7 @@ pub(crate) async fn load_credentials(
             Err(e) => return Err(e),
         }
     }
-    unreachable!()
+    anyhow::bail!("PIN attempts exhausted")
 }
 
 fn resolve_socket_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
@@ -79,13 +78,10 @@ fn find_upstream() -> Option<String> {
         return Some(path);
     }
     let runtime = std::env::var("XDG_RUNTIME_DIR").ok()?;
-    for suffix in ["gcr/ssh", "keyring/ssh", "ssh-agent.socket"] {
-        let path = format!("{runtime}/{suffix}");
-        if std::path::Path::new(&path).exists() {
-            return Some(path);
-        }
-    }
-    None
+    ["gcr/ssh", "keyring/ssh", "ssh-agent.socket"]
+        .into_iter()
+        .map(|s| format!("{runtime}/{s}"))
+        .find(|p| std::path::Path::new(p).exists())
 }
 
 fn systemd_listener() -> Result<Option<tokio::net::UnixListener>> {
@@ -129,12 +125,23 @@ async fn main() -> Result<()> {
         eprintln!("[INFO] upstream agent: {path}");
     }
 
-    let cache = Arc::new(RwLock::new(cache::CredentialCache::new()));
-    udev::start(cache.clone());
+    let cache = Arc::new(RwLock::new(cache::CredentialCache::default()));
+    let agent = agent::FidoAgent::new(cache.clone(), upstream);
+
+    // udev::AsyncMonitorSocket is !Send — must live on a LocalSet.
+    let local = LocalSet::new();
+    local.spawn_local(async move {
+        if let Err(e) = udev::run(cache).await {
+            eprintln!("[ERROR] udev monitor exited: {e:#}");
+        }
+    });
 
     let _ = sd_notify::notify(&[sd_notify::NotifyState::Ready]);
 
-    ssh_agent_lib::agent::listen(listener, agent::FidoAgent::new(cache, upstream)).await?;
+    tokio::select! {
+        res = ssh_agent_lib::agent::listen(listener, agent) => res?,
+        _ = local => {}
+    }
 
     Ok(())
 }
