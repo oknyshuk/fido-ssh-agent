@@ -1,11 +1,11 @@
 [package]
 name = "fido-ssh-agent"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 
 [dependencies]
-ssh-agent-lib = "0.5"
+ssh-agent-lib = "0.6"
 ssh-key = { version = "0.6", default-features = false, features = ["alloc", "ed25519"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "io-util", "time"] }
 anyhow = "1"

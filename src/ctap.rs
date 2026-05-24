@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use ctap_hid_fido2::fidokey::get_assertion::get_assertion_params::GetAssertionArgsBuilder;
 use ctap_hid_fido2::fidokey::get_info::InfoOption;
 use ctap_hid_fido2::public_key::PublicKeyType;
-use ctap_hid_fido2::{Cfg, FidoKeyHidFactory};
+use ctap_hid_fido2::{Cfg, FidoKeyHidFactory, HidParam};
 use secrecy::{ExposeSecret, SecretString};
 use ssh_key::public::{Ed25519PublicKey, KeyData, SkEd25519};
 
@@ -30,23 +30,29 @@ pub struct AssertionResponse {
     pub counter: u32,
 }
 
-pub fn active_devices() -> Vec<DeviceKey> {
+/// Active FIDO devices paired with the current open handle. Identity is the
+/// hidraw path (see `DeviceKey`).
+pub fn active_devices() -> Vec<(DeviceKey, HidParam)> {
     ctap_hid_fido2::get_fidokey_devices()
         .into_iter()
-        .map(|d| DeviceKey(d.param))
+        .filter_map(|info| match info.param {
+            HidParam::Path(p) => Some((DeviceKey(p.clone()), HidParam::Path(p))),
+            HidParam::VidPid { .. } => None,
+        })
         .collect()
 }
 
-fn open(device: &DeviceKey) -> Result<ctap_hid_fido2::FidoKeyHid> {
-    FidoKeyHidFactory::create_by_params(std::slice::from_ref(&device.0), &cfg())
+fn open(param: &HidParam) -> Result<ctap_hid_fido2::FidoKeyHid> {
+    FidoKeyHidFactory::create_by_params(std::slice::from_ref(param), &cfg())
         .context("failed to open FIDO device")
 }
 
 pub fn enumerate_credentials(
     device: &DeviceKey,
+    param: &HidParam,
     pin: &SecretString,
 ) -> Result<Vec<CredentialEntry>> {
-    let fido = open(device)?;
+    let fido = open(param)?;
 
     let supports = |opt| matches!(fido.enable_info_option(opt), Ok(Some(true)));
     if !supports(&InfoOption::CredMgmt) && !supports(&InfoOption::CredentialMgmtPreview) {
@@ -91,13 +97,13 @@ pub fn enumerate_credentials(
 }
 
 pub fn get_assertion(
-    device: &DeviceKey,
+    param: &HidParam,
     pin: &SecretString,
     credential_id: &[u8],
     application: &str,
     data: &[u8],
 ) -> Result<AssertionResponse> {
-    let fido = open(device)?;
+    let fido = open(param)?;
     let args = GetAssertionArgsBuilder::new(application, data)
         .pin(pin.expose_secret())
         .credential_id(credential_id)

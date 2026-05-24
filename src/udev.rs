@@ -1,66 +1,66 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use ctap_hid_fido2::HidParam;
 use futures::StreamExt;
-use tokio::sync::RwLock;
+use tokio::time::Instant;
 use tokio_udev::{AsyncMonitorSocket, EventType, MonitorBuilder};
 
-use crate::cache::{CredentialCache, DeviceKey};
+use crate::cache::CredentialCache;
 
-pub async fn run(cache: Arc<RwLock<CredentialCache>>) -> Result<()> {
+/// Window in which we treat clustered hidraw events as a single change. The
+/// kernel emits remove+add pairs back-to-back during browser `WebAuthn`
+/// re-enumeration; coalescing keeps reconcile work proportional to physical
+/// changes, not event volume.
+const COALESCE_WINDOW: Duration = Duration::from_millis(750);
+
+pub async fn run(cache: Arc<CredentialCache>) -> Result<()> {
     let mut monitor: AsyncMonitorSocket = MonitorBuilder::new()?
         .match_subsystem("hidraw")?
         .listen()?
         .try_into()?;
 
     eprintln!("[INFO] udev monitor started, watching for FIDO devices");
-
-    let mut attempted: HashSet<DeviceKey> = HashSet::new();
-    reconcile(&cache, &mut attempted).await;
+    reconcile(&cache).await;
 
     while let Some(Ok(event)) = monitor.next().await {
-        if matches!(event.event_type(), EventType::Add | EventType::Remove) {
-            // Let the device settle; redundant events during this window
-            // produce idempotent reconciles (attempted-set dedups).
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            reconcile(&cache, &mut attempted).await;
+        if !matches!(event.event_type(), EventType::Add | EventType::Remove) {
+            continue;
         }
+        let deadline = Instant::now() + COALESCE_WINDOW;
+        while let Ok(Some(_)) = tokio::time::timeout_at(deadline, monitor.next()).await {}
+        reconcile(&cache).await;
     }
     Ok(())
 }
 
-async fn reconcile(cache: &Arc<RwLock<CredentialCache>>, attempted: &mut HashSet<DeviceKey>) {
-    let active: HashSet<DeviceKey> =
-        match tokio::task::spawn_blocking(crate::ctap::active_devices).await {
-            Ok(devs) => devs.into_iter().collect(),
-            Err(e) => {
-                eprintln!("[WARN] failed to scan FIDO devices: {e}");
-                return;
-            }
-        };
-
-    let removed = cache.write().await.retain_devices(&active);
-    if removed > 0 {
-        eprintln!("[INFO] evicted {removed} credential(s) for removed device");
-    }
-    attempted.retain(|d| active.contains(d));
-
-    for device in &active {
-        if !attempted.insert(device.clone()) {
-            continue;
+async fn reconcile(cache: &Arc<CredentialCache>) {
+    let visible = match tokio::task::spawn_blocking(crate::ctap::active_devices).await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[WARN] failed to scan FIDO devices: {e}");
+            return;
         }
-        eprintln!("[INFO] new FIDO device detected, loading credentials");
-        match crate::load_credentials(device.clone(), cache).await {
+    };
+
+    cache.refresh_paths(visible.iter().cloned());
+    let to_load: Vec<(_, HidParam)> = visible
+        .into_iter()
+        .filter(|(k, _)| !cache.has_credentials_for(k))
+        .collect();
+
+    for (device, param) in to_load {
+        eprintln!("[INFO] new FIDO device, loading credentials");
+        match crate::load_credentials(&device, &param, cache).await {
             Ok(entries) => {
                 let count = entries.len();
-                cache.write().await.extend(entries);
+                cache.extend(entries);
                 if count > 0 {
                     eprintln!("[INFO] loaded {count} credential(s) from new device");
                 }
             }
-            Err(e) => eprintln!("[WARN] failed to load credentials from new device: {e:#}"),
+            Err(e) => eprintln!("[WARN] failed to load credentials: {e:#}"),
         }
     }
 }

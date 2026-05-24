@@ -1,10 +1,11 @@
 use std::os::unix::io::FromRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+use ctap_hid_fido2::HidParam;
 use secrecy::{ExposeSecret, SecretString};
-use tokio::sync::RwLock;
 use tokio::task::LocalSet;
 
 mod agent;
@@ -15,21 +16,50 @@ mod udev;
 
 const MAX_PIN_ATTEMPTS: u32 = 3;
 
+/// Minimum spacing between PIN dialogs after the previous attempt actually
+/// reached the device (success/wrong-PIN/exhausted). Cancels do *not* engage
+/// the cooldown — see `clear_prompt`.
+const PROMPT_COOLDOWN: Duration = Duration::from_secs(10);
+
 pub(crate) async fn load_credentials(
-    device: cache::DeviceKey,
-    cache: &Arc<RwLock<cache::CredentialCache>>,
+    device: &cache::DeviceKey,
+    param: &HidParam,
+    cache: &Arc<cache::CredentialCache>,
 ) -> Result<Vec<cache::CredentialEntry>> {
+    // Silent path: a known device reappearing keeps its cached PIN.
+    if let Some(pin) = cache.get_pin(device) {
+        let d = device.clone();
+        let p = param.clone();
+        let pin_arg = SecretString::from(pin.expose_secret().to_string());
+        match tokio::task::spawn_blocking(move || ctap::enumerate_credentials(&d, &p, &pin_arg))
+            .await?
+        {
+            Ok(entries) => return Ok(entries),
+            Err(e) if ctap::is_pin_error(&e) => {
+                cache.remove_pin(device);
+                eprintln!("[INFO] cached PIN no longer valid - will prompt");
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    if !cache.try_prompt(device, PROMPT_COOLDOWN) {
+        anyhow::bail!("PIN prompt suppressed (cooldown active)")
+    }
+
     for attempt in 1..=MAX_PIN_ATTEMPTS {
         let pin = tokio::task::spawn_blocking(|| pin::request_pin("Enter PIN for security key"))
-            .await??;
+            .await?
+            .inspect_err(|_| cache.clear_prompt(device))?;
 
-        let pin_for_ctap = SecretString::from(pin.expose_secret().to_string());
         let d = device.clone();
-        match tokio::task::spawn_blocking(move || ctap::enumerate_credentials(&d, &pin_for_ctap))
+        let p = param.clone();
+        let pin_arg = SecretString::from(pin.expose_secret().to_string());
+        match tokio::task::spawn_blocking(move || ctap::enumerate_credentials(&d, &p, &pin_arg))
             .await?
         {
             Ok(entries) => {
-                cache.write().await.set_pin(&device, pin);
+                cache.set_pin(device, pin);
                 return Ok(entries);
             }
             Err(e) if ctap::is_pin_error(&e) && attempt < MAX_PIN_ATTEMPTS => {
@@ -105,19 +135,16 @@ async fn main() -> Result<()> {
         }
     }
 
-    let listener = match systemd_listener()? {
-        Some(l) => {
-            eprintln!("[INFO] using systemd socket activation");
-            l
-        }
-        None => {
-            let socket_path = resolve_socket_path(parse_socket_arg())?;
-            let _ = std::fs::remove_file(&socket_path);
-            let l = tokio::net::UnixListener::bind(&socket_path)
-                .context("failed to bind agent socket")?;
-            eprintln!("[INFO] listening on {}", socket_path.display());
-            l
-        }
+    let listener = if let Some(l) = systemd_listener()? {
+        eprintln!("[INFO] using systemd socket activation");
+        l
+    } else {
+        let socket_path = resolve_socket_path(parse_socket_arg())?;
+        let _ = std::fs::remove_file(&socket_path);
+        let l =
+            tokio::net::UnixListener::bind(&socket_path).context("failed to bind agent socket")?;
+        eprintln!("[INFO] listening on {}", socket_path.display());
+        l
     };
 
     let upstream = find_upstream();
@@ -125,7 +152,7 @@ async fn main() -> Result<()> {
         eprintln!("[INFO] upstream agent: {path}");
     }
 
-    let cache = Arc::new(RwLock::new(cache::CredentialCache::default()));
+    let cache = Arc::new(cache::CredentialCache::default());
     let agent = agent::FidoAgent::new(cache.clone(), upstream);
 
     // udev::AsyncMonitorSocket is !Send — must live on a LocalSet.
@@ -140,7 +167,7 @@ async fn main() -> Result<()> {
 
     tokio::select! {
         res = ssh_agent_lib::agent::listen(listener, agent) => res?,
-        _ = local => {}
+        () = local => {}
     }
 
     Ok(())

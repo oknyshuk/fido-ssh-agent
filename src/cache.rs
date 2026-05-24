@@ -1,5 +1,6 @@
-use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use ctap_hid_fido2::HidParam;
 use secrecy::{ExposeSecret, SecretString};
@@ -7,31 +8,12 @@ use ssh_agent_lib::proto::Identity;
 use ssh_key::PublicKey;
 use ssh_key::public::KeyData;
 
-/// Hashable/Eq wrapper for `HidParam`.
-#[derive(Clone)]
-pub struct DeviceKey(pub HidParam);
-
-impl PartialEq for DeviceKey {
-    fn eq(&self, other: &Self) -> bool {
-        match (&self.0, &other.0) {
-            (HidParam::VidPid { vid: v1, pid: p1 }, HidParam::VidPid { vid: v2, pid: p2 }) => {
-                v1 == v2 && p1 == p2
-            }
-            (HidParam::Path(a), HidParam::Path(b)) => a == b,
-            _ => false,
-        }
-    }
-}
-impl Eq for DeviceKey {}
-
-impl Hash for DeviceKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        match &self.0 {
-            HidParam::VidPid { vid, pid } => (0u8, vid, pid).hash(state),
-            HidParam::Path(p) => (1u8, p).hash(state),
-        }
-    }
-}
+/// Stable per-process identity for a FIDO device. The kernel reliably reuses
+/// the same `/dev/hidrawN` minor across browser-induced `WebAuthn` re-enum, so
+/// path is sufficient. Across suspend/resume or unrelated hidraw churn the
+/// path may renumber; the cost is one PIN re-prompt for that device.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DeviceKey(pub String);
 
 pub struct CredentialEntry {
     pub credential_id: Vec<u8>,
@@ -40,54 +22,119 @@ pub struct CredentialEntry {
     pub device: DeviceKey,
 }
 
+/// Synchronization is internal: every method takes `&self`, locks for one
+/// short critical section, returns owned data. Callers never see a guard,
+/// so "guard alive across `.await`" deadlocks are structurally impossible.
 #[derive(Default)]
-pub struct CredentialCache {
+pub struct CredentialCache(Mutex<Inner>);
+
+#[derive(Default)]
+struct Inner {
     entries: HashMap<KeyData, CredentialEntry>,
     pins: HashMap<DeviceKey, SecretString>,
+    /// Refreshed each reconcile; absence means "unplugged", not "evict me".
+    paths: HashMap<DeviceKey, HidParam>,
+    last_prompt: HashMap<DeviceKey, Instant>,
 }
 
 impl CredentialCache {
-    pub fn extend(&mut self, entries: impl IntoIterator<Item = CredentialEntry>) {
-        self.entries.extend(
-            entries
-                .into_iter()
-                .map(|e| (e.public_key.key_data().clone(), e)),
-        );
+    fn with<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
+        f(&mut self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
     }
 
-    pub fn lookup(&self, key_data: &KeyData) -> Option<&CredentialEntry> {
-        self.entries.get(key_data)
+    pub fn extend(&self, e: impl IntoIterator<Item = CredentialEntry>) {
+        self.with(|i| {
+            i.entries
+                .extend(e.into_iter().map(|c| (c.public_key.key_data().clone(), c)));
+        });
+    }
+
+    /// `(credential_id, application, device)` for a sign request.
+    pub fn lookup(&self, k: &KeyData) -> Option<(Vec<u8>, String, DeviceKey)> {
+        self.with(|i| {
+            i.entries.get(k).map(|e| {
+                (
+                    e.credential_id.clone(),
+                    e.application.clone(),
+                    e.device.clone(),
+                )
+            })
+        })
     }
 
     pub fn identities(&self) -> Vec<Identity> {
-        self.entries
-            .values()
-            .map(|e| Identity {
-                pubkey: e.public_key.key_data().clone(),
-                comment: e.application.clone(),
-            })
-            .collect()
+        self.with(|i| {
+            i.entries
+                .values()
+                .map(|e| Identity {
+                    credential: e.public_key.key_data().clone().into(),
+                    comment: e.application.clone(),
+                })
+                .collect()
+        })
     }
 
-    pub fn set_pin(&mut self, device: &DeviceKey, pin: SecretString) {
-        self.pins.insert(device.clone(), pin);
+    pub fn has_credentials_for(&self, d: &DeviceKey) -> bool {
+        self.with(|i| i.entries.values().any(|e| &e.device == d))
     }
 
-    pub fn get_pin(&self, device: &DeviceKey) -> Option<SecretString> {
-        self.pins
-            .get(device)
-            .map(|p| SecretString::from(p.expose_secret().to_string()))
+    pub fn current_path(&self, d: &DeviceKey) -> Option<HidParam> {
+        self.with(|i| i.paths.get(d).cloned())
     }
 
-    pub fn remove_pin(&mut self, device: &DeviceKey) {
-        self.pins.remove(device);
+    pub fn set_pin(&self, d: &DeviceKey, p: SecretString) {
+        self.with(|i| i.pins.insert(d.clone(), p));
     }
 
-    /// Evict entries for devices not in `active`. Returns count of credentials removed.
-    pub fn retain_devices(&mut self, active: &HashSet<DeviceKey>) -> usize {
-        let before = self.entries.len();
-        self.entries.retain(|_, e| active.contains(&e.device));
-        self.pins.retain(|k, _| active.contains(k));
-        before - self.entries.len()
+    pub fn get_pin(&self, d: &DeviceKey) -> Option<SecretString> {
+        self.with(|i| {
+            i.pins
+                .get(d)
+                .map(|p| SecretString::from(p.expose_secret().to_string()))
+        })
+    }
+
+    pub fn remove_pin(&self, d: &DeviceKey) {
+        self.with(|i| i.pins.remove(d));
+    }
+
+    pub fn refresh_paths(&self, v: impl IntoIterator<Item = (DeviceKey, HidParam)>) {
+        self.with(|i| {
+            i.paths = v.into_iter().collect();
+            // Reap PINs / cooldown stamps for devices that no longer back any
+            // credential and are no longer visible (path renumber across
+            // suspend/resume, unrelated hidraw churn).
+            let alive: std::collections::HashSet<DeviceKey> = i
+                .paths
+                .keys()
+                .cloned()
+                .chain(i.entries.values().map(|e| e.device.clone()))
+                .collect();
+            i.pins.retain(|k, _| alive.contains(k));
+            i.last_prompt.retain(|k, _| alive.contains(k));
+        });
+    }
+
+    /// Atomic test-and-set on a per-device PIN-dialog rate-limit.
+    pub fn try_prompt(&self, d: &DeviceKey, cooldown: Duration) -> bool {
+        self.with(|i| {
+            let now = Instant::now();
+            let allowed = i
+                .last_prompt
+                .get(d)
+                .is_none_or(|t| now.duration_since(*t) >= cooldown);
+            if allowed {
+                i.last_prompt.insert(d.clone(), now);
+            }
+            allowed
+        })
+    }
+
+    /// Release a slot reserved by `try_prompt` (e.g. on user cancel).
+    pub fn clear_prompt(&self, d: &DeviceKey) {
+        self.with(|i| i.last_prompt.remove(d));
     }
 }

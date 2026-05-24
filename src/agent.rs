@@ -1,5 +1,7 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
+use ctap_hid_fido2::HidParam;
 use secrecy::{ExposeSecret, SecretString};
 use ssh_agent_lib::agent::Session;
 use ssh_agent_lib::client::Client;
@@ -7,18 +9,17 @@ use ssh_agent_lib::error::AgentError;
 use ssh_agent_lib::proto::{Identity, SignRequest};
 use ssh_key::{Algorithm, Signature};
 use tokio::net::UnixStream;
-use tokio::sync::RwLock;
 
 use crate::cache::{CredentialCache, DeviceKey};
 
 #[derive(Clone)]
 pub struct FidoAgent {
-    cache: Arc<RwLock<CredentialCache>>,
+    cache: Arc<CredentialCache>,
     upstream: Option<Arc<str>>,
 }
 
 impl FidoAgent {
-    pub fn new(cache: Arc<RwLock<CredentialCache>>, upstream: Option<String>) -> Self {
+    pub fn new(cache: Arc<CredentialCache>, upstream: Option<String>) -> Self {
         Self {
             cache,
             upstream: upstream.map(Into::into),
@@ -41,15 +42,19 @@ impl FidoAgent {
         application: &str,
         data: &[u8],
     ) -> Result<crate::ctap::AssertionResponse, AgentError> {
-        if let Some(pin) = self.cache.read().await.get_pin(device) {
+        let path = || {
+            self.cache.current_path(device).ok_or_else(|| {
+                AgentError::other(std::io::Error::other("FIDO device not connected"))
+            })
+        };
+
+        if let Some(pin) = self.cache.get_pin(device) {
             eprintln!("[INFO] sign request for {application} - touch key");
-            match assert(device, &pin, credential_id, application, data).await {
+            match assert(&path()?, &pin, credential_id, application, data).await {
                 Ok(resp) => return Ok(resp),
                 Err(e) if crate::ctap::is_pin_error(&e) => {
-                    self.cache.write().await.remove_pin(device);
-                    eprintln!(
-                        "[INFO] cached PIN invalid for {application} - enter PIN and touch key"
-                    );
+                    self.cache.remove_pin(device);
+                    eprintln!("[INFO] cached PIN invalid - enter PIN and touch key");
                 }
                 Err(e) => {
                     eprintln!("[ERROR] assertion failed: {e:#}");
@@ -61,13 +66,13 @@ impl FidoAgent {
         }
 
         let pin = prompt_pin().await?;
-        let resp = assert(device, &pin, credential_id, application, data)
+        let resp = assert(&path()?, &pin, credential_id, application, data)
             .await
             .map_err(|e| {
                 eprintln!("[ERROR] assertion failed: {e:#}");
                 AgentError::Other(e.into())
             })?;
-        self.cache.write().await.set_pin(device, pin);
+        self.cache.set_pin(device, pin);
         Ok(resp)
     }
 }
@@ -75,9 +80,12 @@ impl FidoAgent {
 #[ssh_agent_lib::async_trait]
 impl Session for FidoAgent {
     async fn request_identities(&mut self) -> Result<Vec<Identity>, AgentError> {
-        let cache = self.cache.read().await;
-        let mut ids = cache.identities();
+        let mut ids = self.cache.identities();
         if self.upstream.is_some() {
+            let known: HashSet<_> = ids
+                .iter()
+                .map(|id| id.credential.key_data().clone())
+                .collect();
             let upstream = async {
                 let mut client = self.upstream().await?;
                 client.request_identities().await
@@ -86,7 +94,7 @@ impl Session for FidoAgent {
                 Ok(upstream_ids) => ids.extend(
                     upstream_ids
                         .into_iter()
-                        .filter(|id| cache.lookup(&id.pubkey).is_none()),
+                        .filter(|id| !known.contains(id.credential.key_data())),
                 ),
                 Err(e) => eprintln!("[WARN] upstream agent: {e:#}"),
             }
@@ -95,25 +103,18 @@ impl Session for FidoAgent {
     }
 
     async fn sign(&mut self, request: SignRequest) -> Result<Signature, AgentError> {
-        let fido = self.cache.read().await.lookup(&request.pubkey).map(|e| {
-            (
-                e.credential_id.clone(),
-                e.application.clone(),
-                e.device.clone(),
-            )
-        });
-
-        let Some((credential_id, application, device)) = fido else {
+        let key_data = request.credential.key_data();
+        let Some((credential_id, application, device)) = self.cache.lookup(key_data) else {
             if self.upstream.is_some() {
                 eprintln!(
                     "[INFO] sign request for non-FIDO key ({}) -> upstream",
-                    request.pubkey.algorithm(),
+                    key_data.algorithm(),
                 );
                 return self.upstream().await?.sign(request).await;
             }
             eprintln!(
                 "[WARN] sign request for unknown key ({})",
-                request.pubkey.algorithm()
+                key_data.algorithm()
             );
             return Err(AgentError::other(std::io::Error::other("unknown key")));
         };
@@ -146,19 +147,19 @@ async fn prompt_pin() -> Result<SecretString, AgentError> {
 }
 
 async fn assert(
-    device: &DeviceKey,
+    param: &HidParam,
     pin: &SecretString,
     credential_id: &[u8],
     application: &str,
     data: &[u8],
 ) -> anyhow::Result<crate::ctap::AssertionResponse> {
-    let device = device.clone();
+    let param = param.clone();
     let pin = SecretString::from(pin.expose_secret().to_string());
     let cred_id = credential_id.to_vec();
     let app = application.to_string();
     let data = data.to_vec();
     tokio::task::spawn_blocking(move || {
-        crate::ctap::get_assertion(&device, &pin, &cred_id, &app, &data)
+        crate::ctap::get_assertion(&param, &pin, &cred_id, &app, &data)
     })
     .await?
 }
