@@ -4,9 +4,8 @@ use std::time::{Duration, Instant};
 
 use ctap_hid_fido2::HidParam;
 use secrecy::{ExposeSecret, SecretString};
-use ssh_agent_lib::proto::Identity;
-use ssh_key::PublicKey;
-use ssh_key::public::KeyData;
+
+use crate::proto::Identity;
 
 /// Stable per-process identity for a FIDO device. The kernel reliably reuses
 /// the same `/dev/hidrawN` minor across browser-induced `WebAuthn` re-enum, so
@@ -18,7 +17,8 @@ pub struct DeviceKey(pub String);
 pub struct CredentialEntry {
     pub credential_id: Vec<u8>,
     pub application: String,
-    pub public_key: PublicKey,
+    /// Canonical SSH wire-encoded `sk-ssh-ed25519@openssh.com` public key.
+    pub key_blob: Vec<u8>,
     pub device: DeviceKey,
 }
 
@@ -30,7 +30,7 @@ pub struct CredentialCache(Mutex<Inner>);
 
 #[derive(Default)]
 struct Inner {
-    entries: HashMap<KeyData, CredentialEntry>,
+    entries: HashMap<Vec<u8>, CredentialEntry>,
     pins: HashMap<DeviceKey, SecretString>,
     /// Refreshed each reconcile; absence means "unplugged", not "evict me".
     paths: HashMap<DeviceKey, HidParam>,
@@ -48,14 +48,14 @@ impl CredentialCache {
     pub fn extend(&self, e: impl IntoIterator<Item = CredentialEntry>) {
         self.with(|i| {
             i.entries
-                .extend(e.into_iter().map(|c| (c.public_key.key_data().clone(), c)));
+                .extend(e.into_iter().map(|c| (c.key_blob.clone(), c)));
         });
     }
 
     /// `(credential_id, application, device)` for a sign request.
-    pub fn lookup(&self, k: &KeyData) -> Option<(Vec<u8>, String, DeviceKey)> {
+    pub fn lookup(&self, key_blob: &[u8]) -> Option<(Vec<u8>, String, DeviceKey)> {
         self.with(|i| {
-            i.entries.get(k).map(|e| {
+            i.entries.get(key_blob).map(|e| {
                 (
                     e.credential_id.clone(),
                     e.application.clone(),
@@ -70,7 +70,7 @@ impl CredentialCache {
             i.entries
                 .values()
                 .map(|e| Identity {
-                    credential: e.public_key.key_data().clone().into(),
+                    key_blob: e.key_blob.clone(),
                     comment: e.application.clone(),
                 })
                 .collect()

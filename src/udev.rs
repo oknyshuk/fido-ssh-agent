@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use ctap_hid_fido2::HidParam;
-use futures::StreamExt;
+use futures_util::StreamExt;
 use tokio::time::Instant;
 use tokio_udev::{AsyncMonitorSocket, EventType, MonitorBuilder};
 

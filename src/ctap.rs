@@ -4,9 +4,9 @@ use ctap_hid_fido2::fidokey::get_info::InfoOption;
 use ctap_hid_fido2::public_key::PublicKeyType;
 use ctap_hid_fido2::{Cfg, FidoKeyHidFactory, HidParam};
 use secrecy::{ExposeSecret, SecretString};
-use ssh_key::public::{Ed25519PublicKey, KeyData, SkEd25519};
 
 use crate::cache::{CredentialEntry, DeviceKey};
+use crate::proto::write_string;
 
 /// ctap-hid-fido2 reports CTAP errors as strings formatted by `ctapdef::get_ctap_status_message`,
 /// with no structured variants exposed. String-matching is the only option.
@@ -84,11 +84,14 @@ pub fn enumerate_credentials(
                 .as_slice()
                 .try_into()
                 .context("expected 32-byte Ed25519 public key")?;
-            let sk_key = SkEd25519::new(Ed25519PublicKey(pubkey_bytes), rp_id.clone());
+            let mut key_blob = Vec::with_capacity(80);
+            write_string(&mut key_blob, b"sk-ssh-ed25519@openssh.com");
+            write_string(&mut key_blob, &pubkey_bytes);
+            write_string(&mut key_blob, rp_id.as_bytes());
             entries.push(CredentialEntry {
                 credential_id: cred.public_key_credential_descriptor.id.clone(),
                 application: rp_id.clone(),
-                public_key: ssh_key::PublicKey::new(KeyData::SkEd25519(sk_key), ""),
+                key_blob,
                 device: device.clone(),
             });
         }

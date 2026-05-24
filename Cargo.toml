@@ -5,14 +5,12 @@ edition = "2024"
 license = "MIT"
 
 [dependencies]
-ssh-agent-lib = "0.6"
-ssh-key = { version = "0.6", default-features = false, features = ["alloc", "ed25519"] }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "io-util", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "io-util"] }
 anyhow = "1"
 ctap-hid-fido2 = "3.5"
 secrecy = "0.10"
 tokio-udev = "0.10"
-futures = { version = "0.3", default-features = false, features = ["std"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 sd-notify = "0.5"
 libc = "0.2"
 

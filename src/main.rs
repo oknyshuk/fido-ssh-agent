@@ -12,6 +12,7 @@ mod agent;
 mod cache;
 mod ctap;
 mod pin;
+mod proto;
 mod udev;
 
 const MAX_PIN_ATTEMPTS: u32 = 3;
@@ -153,20 +154,38 @@ async fn main() -> Result<()> {
     }
 
     let cache = Arc::new(cache::CredentialCache::default());
-    let agent = agent::FidoAgent::new(cache.clone(), upstream);
+    let upstream_arc: Option<Arc<str>> = upstream.map(Into::into);
 
     // udev::AsyncMonitorSocket is !Send — must live on a LocalSet.
     let local = LocalSet::new();
-    local.spawn_local(async move {
-        if let Err(e) = udev::run(cache).await {
-            eprintln!("[ERROR] udev monitor exited: {e:#}");
+    local.spawn_local({
+        let cache = cache.clone();
+        async move {
+            if let Err(e) = udev::run(cache).await {
+                eprintln!("[ERROR] udev monitor exited: {e:#}");
+            }
         }
     });
 
     let _ = sd_notify::notify(&[sd_notify::NotifyState::Ready]);
 
+    let serve = async move {
+        loop {
+            let (stream, _) = listener.accept().await?;
+            let cache = cache.clone();
+            let upstream = upstream_arc.clone();
+            tokio::spawn(async move {
+                if let Err(e) = agent::handle_connection(stream, cache, upstream).await {
+                    eprintln!("[WARN] agent connection: {e:#}");
+                }
+            });
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), std::io::Error>(())
+    };
+
     tokio::select! {
-        res = ssh_agent_lib::agent::listen(listener, agent) => res?,
+        res = serve => res?,
         () = local => {}
     }
 
