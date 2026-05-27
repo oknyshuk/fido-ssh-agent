@@ -20,13 +20,13 @@ const MAX_FRAME: usize = 256 * 1024;
 
 /// One identity in `SSH_AGENT_IDENTITIES_ANSWER` (§3.5).
 #[derive(Clone)]
-pub struct Identity {
+pub(crate) struct Identity {
     pub key_blob: Vec<u8>,
     pub comment: String,
 }
 
 /// Decoded `SSH_AGENTC_SIGN_REQUEST` (§3.6).
-pub struct SignRequest {
+pub(crate) struct SignRequest {
     pub key_blob: Vec<u8>,
     pub data: Vec<u8>,
     pub flags: u32,
@@ -34,7 +34,7 @@ pub struct SignRequest {
 
 /// Server-side decoded request. Only the variants we actually handle are
 /// listed; everything else is `Unknown(u8)` and answered with FAILURE.
-pub enum Request {
+pub(crate) enum Request {
     Identities,
     Sign(SignRequest),
     Unknown,
@@ -69,7 +69,7 @@ fn write_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_be_bytes());
 }
 
-pub fn write_string(out: &mut Vec<u8>, s: &[u8]) {
+pub(crate) fn write_string(out: &mut Vec<u8>, s: &[u8]) {
     let len = u32::try_from(s.len()).expect("ssh-string exceeds u32::MAX bytes");
     write_u32(out, len);
     out.extend_from_slice(s);
@@ -77,7 +77,7 @@ pub fn write_string(out: &mut Vec<u8>, s: &[u8]) {
 
 // --- Frame I/O ---------------------------------------------------------------
 
-pub async fn read_frame(s: &mut UnixStream) -> io::Result<Option<Vec<u8>>> {
+pub(crate) async fn read_frame(s: &mut UnixStream) -> io::Result<Option<Vec<u8>>> {
     let mut len_buf = [0u8; 4];
     match s.read_exact(&mut len_buf).await {
         Ok(_) => {}
@@ -96,7 +96,7 @@ pub async fn read_frame(s: &mut UnixStream) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(payload))
 }
 
-pub async fn write_frame(s: &mut UnixStream, payload: &[u8]) -> io::Result<()> {
+pub(crate) async fn write_frame(s: &mut UnixStream, payload: &[u8]) -> io::Result<()> {
     let len = u32::try_from(payload.len())
         .map_err(|_| io::Error::other("agent frame exceeds u32::MAX bytes"))?;
     s.write_all(&len.to_be_bytes()).await?;
@@ -106,7 +106,7 @@ pub async fn write_frame(s: &mut UnixStream, payload: &[u8]) -> io::Result<()> {
 
 // --- Server: decode requests / encode responses ------------------------------
 
-pub fn decode_request(frame: &[u8]) -> io::Result<Request> {
+pub(crate) fn decode_request(frame: &[u8]) -> io::Result<Request> {
     let mut b = frame;
     Ok(match read_u8(&mut b)? {
         SSH_AGENTC_REQUEST_IDENTITIES => Request::Identities,
@@ -122,11 +122,11 @@ pub fn decode_request(frame: &[u8]) -> io::Result<Request> {
     })
 }
 
-pub fn encode_failure() -> Vec<u8> {
+pub(crate) fn encode_failure() -> Vec<u8> {
     vec![SSH_AGENT_FAILURE]
 }
 
-pub fn encode_identities(ids: &[Identity]) -> Vec<u8> {
+pub(crate) fn encode_identities(ids: &[Identity]) -> Vec<u8> {
     let mut out = Vec::with_capacity(64);
     out.push(SSH_AGENT_IDENTITIES_ANSWER);
     write_u32(
@@ -140,7 +140,7 @@ pub fn encode_identities(ids: &[Identity]) -> Vec<u8> {
     out
 }
 
-pub fn encode_sign_response(signature: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_sign_response(signature: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + signature.len());
     out.push(SSH_AGENT_SIGN_RESPONSE);
     write_string(&mut out, signature);
@@ -149,7 +149,7 @@ pub fn encode_sign_response(signature: &[u8]) -> Vec<u8> {
 
 // --- Client: round-trip a request to an upstream agent -----------------------
 
-pub async fn fetch_identities(s: &mut UnixStream) -> io::Result<Vec<Identity>> {
+pub(crate) async fn fetch_identities(s: &mut UnixStream) -> io::Result<Vec<Identity>> {
     write_frame(s, &[SSH_AGENTC_REQUEST_IDENTITIES]).await?;
     let frame = read_frame(s).await?.ok_or(io::ErrorKind::UnexpectedEof)?;
     let mut b = &frame[..];
@@ -171,7 +171,7 @@ pub async fn fetch_identities(s: &mut UnixStream) -> io::Result<Vec<Identity>> {
 /// Forward a verbatim `SSH_AGENTC_SIGN_REQUEST` to upstream and return the
 /// raw signature blob. We pass the request bytes through unchanged so the
 /// upstream gets exactly what the client sent.
-pub async fn forward_sign(s: &mut UnixStream, req: &SignRequest) -> io::Result<Vec<u8>> {
+pub(crate) async fn forward_sign(s: &mut UnixStream, req: &SignRequest) -> io::Result<Vec<u8>> {
     let mut frame = Vec::with_capacity(16 + req.key_blob.len() + req.data.len());
     frame.push(SSH_AGENTC_SIGN_REQUEST);
     write_string(&mut frame, &req.key_blob);

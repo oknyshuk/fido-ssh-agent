@@ -45,6 +45,7 @@
                 // {
                   inherit cargoArtifacts;
                   doCheck = false;
+                  FIDO_ASKPASS = "${pkgs.x11_ssh_askpass}/libexec/x11-ssh-askpass";
                   postInstall = ''
                     install -Dm644 ${./systemd/fido-ssh-agent.service} \
                       $out/share/systemd/user/fido-ssh-agent.service

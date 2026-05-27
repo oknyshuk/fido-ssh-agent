@@ -5,9 +5,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use ctap_hid_fido2::HidParam;
-use secrecy::{ExposeSecret, SecretString};
 use tokio::task::LocalSet;
 
+#[macro_use]
+mod log;
 mod agent;
 mod cache;
 mod ctap;
@@ -19,8 +20,12 @@ const MAX_PIN_ATTEMPTS: u32 = 3;
 
 /// Minimum spacing between PIN dialogs after the previous attempt actually
 /// reached the device (success/wrong-PIN/exhausted). Cancels do *not* engage
-/// the cooldown — see `clear_prompt`.
+/// the cooldown — see `clear_prompt` / `PinError::engages_cooldown`.
 const PROMPT_COOLDOWN: Duration = Duration::from_secs(10);
+
+/// Default sustained-absence threshold: if a device sits unplugged for at
+/// least this long, its cached PIN is dropped. 0 disables the policy.
+const DEFAULT_UNPLUG_GRACE: Duration = Duration::from_secs(5);
 
 pub(crate) async fn load_credentials(
     device: &cache::DeviceKey,
@@ -31,14 +36,13 @@ pub(crate) async fn load_credentials(
     if let Some(pin) = cache.get_pin(device) {
         let d = device.clone();
         let p = param.clone();
-        let pin_arg = SecretString::from(pin.expose_secret().to_string());
-        match tokio::task::spawn_blocking(move || ctap::enumerate_credentials(&d, &p, &pin_arg))
-            .await?
+        let pin = pin.clone();
+        match tokio::task::spawn_blocking(move || ctap::enumerate_credentials(&d, &p, &pin)).await?
         {
             Ok(entries) => return Ok(entries),
             Err(e) if ctap::is_pin_error(&e) => {
                 cache.remove_pin(device);
-                eprintln!("[INFO] cached PIN no longer valid - will prompt");
+                info!("cached PIN no longer valid - will prompt");
             }
             Err(e) => return Err(e),
         }
@@ -49,13 +53,19 @@ pub(crate) async fn load_credentials(
     }
 
     for attempt in 1..=MAX_PIN_ATTEMPTS {
-        let pin = tokio::task::spawn_blocking(|| pin::request_pin("Enter PIN for security key"))
-            .await?
-            .inspect_err(|_| cache.clear_prompt(device))?;
+        let pin = match pin::request_pin("Enter PIN for security key").await {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                if !e.engages_cooldown() {
+                    cache.clear_prompt(device);
+                }
+                return Err(anyhow::anyhow!(e));
+            }
+        };
 
         let d = device.clone();
         let p = param.clone();
-        let pin_arg = SecretString::from(pin.expose_secret().to_string());
+        let pin_arg = pin.clone();
         match tokio::task::spawn_blocking(move || ctap::enumerate_credentials(&d, &p, &pin_arg))
             .await?
         {
@@ -64,7 +74,7 @@ pub(crate) async fn load_credentials(
                 return Ok(entries);
             }
             Err(e) if ctap::is_pin_error(&e) && attempt < MAX_PIN_ATTEMPTS => {
-                eprintln!("[WARN] wrong PIN ({attempt}/{MAX_PIN_ATTEMPTS})");
+                warn_!("wrong PIN ({attempt}/{MAX_PIN_ATTEMPTS})");
             }
             Err(e) => return Err(e),
         }
@@ -86,15 +96,19 @@ fn resolve_socket_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
 fn parse_socket_arg() -> Option<PathBuf> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
-        Some("--socket") => Some(PathBuf::from(
-            args.next().expect("--socket requires a path"),
-        )),
+        Some("--socket") => match args.next() {
+            Some(p) => Some(PathBuf::from(p)),
+            None => {
+                err!("--socket requires a path");
+                std::process::exit(1);
+            }
+        },
         Some("--help" | "-h") => {
             eprintln!("Usage: fido-ssh-agent [--socket PATH]");
             std::process::exit(0);
         }
         Some(other) => {
-            eprintln!("unknown argument: {other}");
+            err!("unknown argument: {other}");
             eprintln!("Usage: fido-ssh-agent [--socket PATH]");
             std::process::exit(1);
         }
@@ -115,45 +129,63 @@ fn find_upstream() -> Option<String> {
         .find(|p| std::path::Path::new(p).exists())
 }
 
+fn unplug_grace_from_env() -> Duration {
+    std::env::var("FIDO_SSH_AGENT_UNPLUG_GRACE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map_or(DEFAULT_UNPLUG_GRACE, Duration::from_secs)
+}
+
 fn systemd_listener() -> Result<Option<tokio::net::UnixListener>> {
     let mut fds = sd_notify::listen_fds()?;
     let Some(fd) = fds.next() else {
         return Ok(None);
     };
+    // SAFETY: `fd` is yielded once by `sd_notify::listen_fds()`, which transfers
+    // ownership exactly to this caller per `sd_listen_fds(3)`. We immediately
+    // wrap in a typed `UnixListener`, which takes ownership of the fd.
     let std_listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
     std_listener.set_nonblocking(true)?;
     Ok(Some(tokio::net::UnixListener::from_std(std_listener)?))
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Suppress println! noise from ctap-hid-fido2 (we log to stderr)
-    unsafe {
-        let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
-        if devnull >= 0 {
-            libc::dup2(devnull, libc::STDOUT_FILENO);
-            libc::close(devnull);
-        }
+async fn serve(
+    listener: tokio::net::UnixListener,
+    cache: Arc<cache::CredentialCache>,
+    upstream: Option<Arc<str>>,
+) -> std::io::Result<()> {
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let cache = cache.clone();
+        let upstream = upstream.clone();
+        tokio::spawn(async move {
+            if let Err(e) = agent::handle_connection(stream, cache, upstream).await {
+                warn_!("agent connection: {e:#}");
+            }
+        });
     }
+}
 
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
     let listener = if let Some(l) = systemd_listener()? {
-        eprintln!("[INFO] using systemd socket activation");
+        info!("using systemd socket activation");
         l
     } else {
         let socket_path = resolve_socket_path(parse_socket_arg())?;
         let _ = std::fs::remove_file(&socket_path);
         let l =
             tokio::net::UnixListener::bind(&socket_path).context("failed to bind agent socket")?;
-        eprintln!("[INFO] listening on {}", socket_path.display());
+        info!("listening on {}", socket_path.display());
         l
     };
 
     let upstream = find_upstream();
     if let Some(ref path) = upstream {
-        eprintln!("[INFO] upstream agent: {path}");
+        info!("upstream agent: {path}");
     }
 
-    let cache = Arc::new(cache::CredentialCache::default());
+    let cache = Arc::new(cache::CredentialCache::new(unplug_grace_from_env()));
     let upstream_arc: Option<Arc<str>> = upstream.map(Into::into);
 
     // udev::AsyncMonitorSocket is !Send — must live on a LocalSet.
@@ -162,30 +194,15 @@ async fn main() -> Result<()> {
         let cache = cache.clone();
         async move {
             if let Err(e) = udev::run(cache).await {
-                eprintln!("[ERROR] udev monitor exited: {e:#}");
+                err!("udev monitor exited: {e:#}");
             }
         }
     });
 
     let _ = sd_notify::notify(&[sd_notify::NotifyState::Ready]);
 
-    let serve = async move {
-        loop {
-            let (stream, _) = listener.accept().await?;
-            let cache = cache.clone();
-            let upstream = upstream_arc.clone();
-            tokio::spawn(async move {
-                if let Err(e) = agent::handle_connection(stream, cache, upstream).await {
-                    eprintln!("[WARN] agent connection: {e:#}");
-                }
-            });
-        }
-        #[allow(unreachable_code)]
-        Ok::<(), std::io::Error>(())
-    };
-
     tokio::select! {
-        res = serve => res?,
+        res = serve(listener, cache, upstream_arc) => res?,
         () = local => {}
     }
 

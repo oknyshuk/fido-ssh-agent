@@ -10,7 +10,7 @@ use crate::proto::write_string;
 
 /// ctap-hid-fido2 reports CTAP errors as strings formatted by `ctapdef::get_ctap_status_message`,
 /// with no structured variants exposed. String-matching is the only option.
-pub fn is_pin_error(err: &anyhow::Error) -> bool {
+pub(crate) fn is_pin_error(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         let msg = cause.to_string();
         msg.contains("CTAP2_ERR_PIN_INVALID") || msg.contains("CTAP2_ERR_PIN_AUTH_INVALID")
@@ -24,7 +24,7 @@ fn cfg() -> Cfg {
     }
 }
 
-pub struct AssertionResponse {
+pub(crate) struct AssertionResponse {
     pub signature: Vec<u8>,
     pub flags: u8,
     pub counter: u32,
@@ -32,7 +32,7 @@ pub struct AssertionResponse {
 
 /// Active FIDO devices paired with the current open handle. Identity is the
 /// hidraw path (see `DeviceKey`).
-pub fn active_devices() -> Vec<(DeviceKey, HidParam)> {
+pub(crate) fn active_devices() -> Vec<(DeviceKey, HidParam)> {
     ctap_hid_fido2::get_fidokey_devices()
         .into_iter()
         .filter_map(|info| match info.param {
@@ -47,7 +47,7 @@ fn open(param: &HidParam) -> Result<ctap_hid_fido2::FidoKeyHid> {
         .context("failed to open FIDO device")
 }
 
-pub fn enumerate_credentials(
+pub(crate) fn enumerate_credentials(
     device: &DeviceKey,
     param: &HidParam,
     pin: &SecretString,
@@ -99,7 +99,7 @@ pub fn enumerate_credentials(
     Ok(entries)
 }
 
-pub fn get_assertion(
+pub(crate) fn get_assertion(
     param: &HidParam,
     pin: &SecretString,
     credential_id: &[u8],

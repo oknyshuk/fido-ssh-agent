@@ -15,16 +15,24 @@ use crate::cache::CredentialCache;
 /// changes, not event volume.
 const COALESCE_WINDOW: Duration = Duration::from_millis(750);
 
-pub async fn run(cache: Arc<CredentialCache>) -> Result<()> {
+pub(crate) async fn run(cache: Arc<CredentialCache>) -> Result<()> {
     let mut monitor: AsyncMonitorSocket = MonitorBuilder::new()?
         .match_subsystem("hidraw")?
         .listen()?
         .try_into()?;
 
-    eprintln!("[INFO] udev monitor started, watching for FIDO devices");
+    info!("udev monitor started, watching for FIDO devices");
     reconcile(&cache).await;
 
-    while let Some(Ok(event)) = monitor.next().await {
+    loop {
+        let event = match monitor.next().await {
+            Some(Ok(e)) => e,
+            Some(Err(e)) => {
+                warn_!("udev event error: {e}");
+                continue;
+            }
+            None => break,
+        };
         if !matches!(event.event_type(), EventType::Add | EventType::Remove) {
             continue;
         }
@@ -39,7 +47,7 @@ async fn reconcile(cache: &Arc<CredentialCache>) {
     let visible = match tokio::task::spawn_blocking(crate::ctap::active_devices).await {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("[WARN] failed to scan FIDO devices: {e}");
+            warn_!("failed to scan FIDO devices: {e}");
             return;
         }
     };
@@ -51,16 +59,16 @@ async fn reconcile(cache: &Arc<CredentialCache>) {
         .collect();
 
     for (device, param) in to_load {
-        eprintln!("[INFO] new FIDO device, loading credentials");
+        info!("new FIDO device, loading credentials");
         match crate::load_credentials(&device, &param, cache).await {
             Ok(entries) => {
                 let count = entries.len();
                 cache.extend(entries);
                 if count > 0 {
-                    eprintln!("[INFO] loaded {count} credential(s) from new device");
+                    info!("loaded {count} credential(s) from new device");
                 }
             }
-            Err(e) => eprintln!("[WARN] failed to load credentials: {e:#}"),
+            Err(e) => warn_!("failed to load credentials: {e:#}"),
         }
     }
 }
